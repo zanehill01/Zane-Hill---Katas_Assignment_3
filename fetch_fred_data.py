@@ -11,6 +11,7 @@ Optional:
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import time
@@ -20,6 +21,42 @@ from typing import Any
 import requests
 
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
+
+
+def exponential_backoff(attempt: int, base_delay: float) -> float:
+    """Calculate exponential backoff delay for a retry attempt."""
+    return base_delay * (2 ** (attempt - 1))
+
+
+def save_results(payload: dict[str, Any], out_path: Path, series_id: str) -> None:
+    """Save fetched data to JSON or CSV based on file extension."""
+    suffix = out_path.suffix.lower()
+
+    if suffix == ".json":
+        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return
+
+    if suffix == ".csv":
+        observations = payload.get("observations", [])
+        with out_path.open("w", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(
+                csv_file,
+                fieldnames=["series_id", "date", "value", "realtime_start", "realtime_end"],
+            )
+            writer.writeheader()
+            for obs in observations:
+                writer.writerow(
+                    {
+                        "series_id": series_id,
+                        "date": obs.get("date"),
+                        "value": obs.get("value"),
+                        "realtime_start": obs.get("realtime_start"),
+                        "realtime_end": obs.get("realtime_end"),
+                    }
+                )
+        return
+
+    raise ValueError("Unsupported output format. Use .json or .csv")
 
 
 def fetch_fred_observations(
@@ -62,7 +99,11 @@ def fetch_fred_observations(
 
                 if response.status_code == 429:
                     retry_after = response.headers.get("Retry-After")
-                    backoff = float(retry_after) if retry_after else attempt * delay_seconds
+                    backoff = (
+                        float(retry_after)
+                        if retry_after
+                        else exponential_backoff(attempt, delay_seconds)
+                    )
                     if attempt == max_retries:
                         raise RuntimeError("Rate limit exceeded after retries (HTTP 429).")
                     time.sleep(backoff)
@@ -77,7 +118,7 @@ def fetch_fred_observations(
                         raise RuntimeError(
                             f"FRED server error {response.status_code} after retries."
                         )
-                    time.sleep(attempt * delay_seconds)
+                    time.sleep(exponential_backoff(attempt, delay_seconds))
                     continue
 
                 response.raise_for_status()
@@ -86,7 +127,7 @@ def fetch_fred_observations(
             except requests.RequestException as error:
                 if attempt == max_retries:
                     raise RuntimeError(f"Network/request error after retries: {error}") from error
-                time.sleep(attempt * delay_seconds)
+                time.sleep(exponential_backoff(attempt, delay_seconds))
 
         if payload is None:
             raise RuntimeError("Failed to fetch FRED data after retries.")
@@ -132,7 +173,7 @@ def main() -> None:
     parser.add_argument("--all", action="store_true", help="Fetch all available observations (uses pagination)")
     parser.add_argument("--delay", type=float, default=0.25, help="Delay between paginated API requests in seconds")
     parser.add_argument("--retries", type=int, default=3, help="Max retries per request")
-    parser.add_argument("--out", default=None, help="Optional path to save full JSON response")
+    parser.add_argument("--out", default=None, help="Optional path to save response (.json or .csv)")
     args = parser.parse_args()
 
     api_key = os.getenv("FRED_API_KEY")
@@ -164,8 +205,11 @@ def main() -> None:
 
     if args.out:
         out_path = Path(args.out)
-        out_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        print(f"Saved full response to: {out_path}")
+        try:
+            save_results(payload, out_path, args.series_id)
+            print(f"Saved full response to: {out_path}")
+        except ValueError as error:
+            raise SystemExit(str(error)) from error
 
 
 if __name__ == "__main__":
