@@ -25,7 +25,7 @@ BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
 def exponential_backoff(attempt: int, base_delay: float) -> float:
     """Calculate exponential backoff delay for a retry attempt."""
-    return base_delay * (2 ** (attempt - 1))
+    return min(base_delay * (3 ** (attempt - 1)), 6.0)
 
 
 def save_results(payload: dict[str, Any], out_path: Path, series_id: str) -> None:
