@@ -13,11 +13,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import urlopen
+
+import requests
 
 BASE_URL = "https://api.stlouisfed.org/fred/series/observations"
 
@@ -27,14 +27,15 @@ def fetch_fred_observations(
     series_id: str,
     start: str | None = None,
     end: str | None = None,
-    limit: int = 10,
+    limit: int | None = 10,
+    delay_seconds: float = 0.25,
+    max_retries: int = 3,
 ) -> dict[str, Any]:
-    """Fetch observations for a FRED series."""
+    """Fetch observations for a FRED series, handling paginated responses."""
     params: dict[str, str | int] = {
         "series_id": series_id,
         "api_key": api_key,
         "file_type": "json",
-        "limit": limit,
         "sort_order": "desc",
     }
 
@@ -43,10 +44,83 @@ def fetch_fred_observations(
     if end:
         params["observation_end"] = end
 
-    url = f"{BASE_URL}?{urlencode(params)}"
+    requested_total = limit
+    page_limit = 1000 if requested_total is None else max(1, min(requested_total, 1000))
+    offset = 0
+    collected: list[dict[str, Any]] = []
+    first_payload: dict[str, Any] | None = None
 
-    with urlopen(url, timeout=15) as response:
-        return json.loads(response.read().decode("utf-8"))
+    while True:
+        page_params = dict(params)
+        page_params["limit"] = page_limit
+        page_params["offset"] = offset
+
+        payload: dict[str, Any] | None = None
+        for attempt in range(1, max_retries + 1):
+            try:
+                response = requests.get(BASE_URL, params=page_params, timeout=15)
+
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    backoff = float(retry_after) if retry_after else attempt * delay_seconds
+                    if attempt == max_retries:
+                        raise RuntimeError("Rate limit exceeded after retries (HTTP 429).")
+                    time.sleep(backoff)
+                    continue
+
+                if 400 <= response.status_code < 500:
+                    raise RuntimeError(
+                        f"FRED client error {response.status_code}: {response.text}"
+                    )
+                if 500 <= response.status_code < 600:
+                    if attempt == max_retries:
+                        raise RuntimeError(
+                            f"FRED server error {response.status_code} after retries."
+                        )
+                    time.sleep(attempt * delay_seconds)
+                    continue
+
+                response.raise_for_status()
+                payload = response.json()
+                break
+            except requests.RequestException as error:
+                if attempt == max_retries:
+                    raise RuntimeError(f"Network/request error after retries: {error}") from error
+                time.sleep(attempt * delay_seconds)
+
+        if payload is None:
+            raise RuntimeError("Failed to fetch FRED data after retries.")
+
+        if first_payload is None:
+            first_payload = payload
+
+        page_observations = payload.get("observations", [])
+        if not page_observations:
+            break
+
+        collected.extend(page_observations)
+        total_available = int(payload.get("count", len(collected)))
+
+        if requested_total is not None and len(collected) >= requested_total:
+            collected = collected[:requested_total]
+            break
+
+        if len(collected) >= total_available:
+            break
+
+        offset += len(page_observations)
+        if requested_total is not None:
+            remaining = requested_total - len(collected)
+            page_limit = max(1, min(remaining, 1000))
+
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+
+    result = dict(first_payload or {})
+    result["observations"] = collected
+    result["offset"] = 0
+    result["limit"] = len(collected)
+    return result
 
 
 def main() -> None:
@@ -55,6 +129,9 @@ def main() -> None:
     parser.add_argument("--start", default=None, help="Observation start date (YYYY-MM-DD)")
     parser.add_argument("--end", default=None, help="Observation end date (YYYY-MM-DD)")
     parser.add_argument("--limit", type=int, default=10, help="Max observations to return")
+    parser.add_argument("--all", action="store_true", help="Fetch all available observations (uses pagination)")
+    parser.add_argument("--delay", type=float, default=0.25, help="Delay between paginated API requests in seconds")
+    parser.add_argument("--retries", type=int, default=3, help="Max retries per request")
     parser.add_argument("--out", default=None, help="Optional path to save full JSON response")
     args = parser.parse_args()
 
@@ -71,12 +148,12 @@ def main() -> None:
             series_id=args.series_id,
             start=args.start,
             end=args.end,
-            limit=args.limit,
+            limit=None if args.all else args.limit,
+            delay_seconds=args.delay,
+            max_retries=args.retries,
         )
-    except HTTPError as error:
-        raise SystemExit(f"FRED HTTP error {error.code}: {error.reason}") from error
-    except URLError as error:
-        raise SystemExit(f"Network error: {error.reason}") from error
+    except RuntimeError as error:
+        raise SystemExit(str(error)) from error
 
     observations = payload.get("observations", [])
     print(f"Series: {args.series_id}")
